@@ -1,0 +1,12 @@
+[package]
+name = "client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+shared = { path = "../shared" }
+leptos.workspace = true
+leptos_router.workspace = true
+serde.workspace = true
+chrono.workspace = true
+
