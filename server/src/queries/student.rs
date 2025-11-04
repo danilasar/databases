@@ -91,6 +91,621 @@ pub async fn get_student_subjects(
         .await
 }
 
+// LEFT JOIN - Все предметы студента с информацией о назначенных преподавателях
+pub async fn get_all_subjects_with_teachers(
+    pool: &PgPool,
+    student_id: i32
+) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+    let query = r#"
+        SELECT 
+            sub.name as subject_name,
+            ps.term,
+            c.name as clarification_type,
+            COALESCE(
+                CONCAT(p.surname, ' ', p.name, 
+                CASE WHEN p.patronymic IS NOT NULL THEN ' ' || p.patronymic ELSE '' END),
+                'Преподаватель не назначен'
+            ) as teacher_name,
+            COALESCE(sub.description, 'Описание отсутствует') as description
+        FROM students s
+        INNER JOIN groups g ON g.id = s."group"
+        INNER JOIN curriculums cur ON cur.id = g.curriculum
+        INNER JOIN planned_subjects ps ON ps.curriculum = cur.id
+        INNER JOIN subjects sub ON sub.id = ps.subject
+        INNER JOIN clarifications c ON c.id = ps.clarification
+        LEFT JOIN teaching_load tl ON tl.planned_subject = ps.id
+        LEFT JOIN teachers t ON t.id = tl.teacher
+        LEFT JOIN people p ON p.id = t.person
+        WHERE s.id = $1
+        ORDER BY ps.term, sub.name
+    "#;
+    
+    let rows = sqlx::query(query)
+        .bind(student_id)
+        .fetch_all(pool)
+        .await?;
+    
+    let result: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "subject_name": row.get::<String, _>("subject_name"),
+                "term": row.get::<i32, _>("term"),
+                "clarification_type": row.get::<String, _>("clarification_type"),
+                "teacher_name": row.get::<String, _>("teacher_name"),
+                "description": row.get::<String, _>("description")
+            })
+        })
+        .collect();
+    
+    Ok(result)
+}
+
+// RIGHT JOIN - Все одногруппники с информацией о полученных оценках
+pub async fn get_classmates_with_marks(
+    pool: &PgPool,
+    student_id: i32
+) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+    let query = r#"
+        SELECT 
+            CONCAT(p.surname, ' ', p.name, 
+                CASE WHEN p.patronymic IS NOT NULL THEN ' ' || p.patronymic ELSE '' END) as student_name,
+            COALESCE(mark_count, 0) as total_marks,
+            g.course,
+            spec.name as speciality
+        FROM marks m
+        RIGHT JOIN students s ON s.id = m.student
+        RIGHT JOIN people p ON p.id = s.person
+        INNER JOIN groups g ON g.id = s."group"
+        INNER JOIN specialities spec ON spec.id = g.speciality
+        CROSS JOIN LATERAL (
+            SELECT COUNT(*) as mark_count
+            FROM marks m2 
+            WHERE m2.student = s.id
+        ) mark_stats
+        WHERE s."group" = (
+            SELECT "group" FROM students WHERE id = $1
+        )
+        ORDER BY student_name
+    "#;
+    
+    let rows = sqlx::query(query)
+        .bind(student_id)
+        .fetch_all(pool)
+        .await?;
+    
+    let result: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "student_name": row.get::<String, _>("student_name"),
+                "total_marks": row.get::<i64, _>("total_marks"),
+                "course": row.get::<i32, _>("course"),
+                "speciality": row.get::<String, _>("speciality")
+            })
+        })
+        .collect();
+    
+    Ok(result)
+}
+
+// FULL JOIN - Сравнение успеваемости со всеми студентами группы
+pub async fn get_full_group_performance(
+    pool: &PgPool,
+    student_id: i32
+) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+    let query = r#"
+        SELECT 
+            COALESCE(
+                CONCAT(p.surname, ' ', p.name, 
+                CASE WHEN p.patronymic IS NOT NULL THEN ' ' || p.patronymic ELSE '' END),
+                'Студент не найден'
+            ) as student_name,
+            COALESCE(sub.name, 'Предмет не найден') as subject_name,
+            CASE 
+                WHEN m.id IS NOT NULL THEN 'Оценка получена'
+                ELSE 'Оценка отсутствует'
+            END as mark_status
+        FROM students s
+        FULL JOIN marks m ON m.student = s.id
+        FULL JOIN planned_subjects ps ON ps.id = m.subject
+        FULL JOIN subjects sub ON sub.id = ps.subject
+        LEFT JOIN people p ON p.id = s.person
+        WHERE s."group" = (
+            SELECT "group" FROM students WHERE id = $1
+        ) OR s."group" IS NULL
+        ORDER BY student_name, subject_name
+    "#;
+    
+    let rows = sqlx::query(query)
+        .bind(student_id)
+        .fetch_all(pool)
+        .await?;
+    
+    let result: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "student_name": row.get::<String, _>("student_name"),
+                "subject_name": row.get::<String, _>("subject_name"),
+                "mark_status": row.get::<String, _>("mark_status")
+            })
+        })
+        .collect();
+    
+    Ok(result)
+}
+
+// CROSS JOIN - Матрица всех возможных комбинаций студент-предмет
+pub async fn get_student_subject_matrix(
+    pool: &PgPool,
+    student_id: i32
+) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+    let query = r#"
+        SELECT 
+            CONCAT(p.surname, ' ', p.name) as student_name,
+            sub.name as subject_name,
+            ps.term,
+            CASE 
+                WHEN m.id IS NOT NULL THEN 'Сдано'
+                ELSE 'Не сдано'
+            END as status
+        FROM students s
+        CROSS JOIN planned_subjects ps
+        INNER JOIN people p ON p.id = s.person
+        INNER JOIN subjects sub ON sub.id = ps.subject
+        LEFT JOIN marks m ON m.student = s.id AND m.subject = ps.id
+        WHERE s."group" = (
+            SELECT "group" FROM students WHERE id = $1
+        )
+        AND ps.curriculum = (
+            SELECT curriculum FROM groups g 
+            INNER JOIN students s2 ON s2."group" = g.id 
+            WHERE s2.id = $1
+        )
+        ORDER BY student_name, ps.term, sub.name
+        LIMIT 100
+    "#;
+    
+    let rows = sqlx::query(query)
+        .bind(student_id)
+        .bind(student_id)
+        .fetch_all(pool)
+        .await?;
+    
+    let result: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "student_name": row.get::<String, _>("student_name"),
+                "subject_name": row.get::<String, _>("subject_name"),
+                "term": row.get::<i32, _>("term"),
+                "status": row.get::<String, _>("status")
+            })
+        })
+        .collect();
+    
+    Ok(result)
+}
+
+// Самосоединение - Сравнение студента с другими студентами той же специальности
+pub async fn compare_with_same_speciality(
+    pool: &PgPool,
+    student_id: i32
+) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+    let query = r#"
+        SELECT 
+            current_student.full_name as current_student,
+            other_student.full_name as other_student,
+            current_student.course as current_course,
+            other_student.course as other_course,
+            current_student.speciality,
+            CASE 
+                WHEN current_student.course > other_student.course THEN 'Старше'
+                WHEN current_student.course < other_student.course THEN 'Младше'
+                ELSE 'Тот же курс'
+            END as comparison
+        FROM (
+            SELECT 
+                s.id,
+                CONCAT(p.surname, ' ', p.name) as full_name,
+                g.course,
+                spec.name as speciality
+            FROM students s
+            INNER JOIN people p ON p.id = s.person
+            INNER JOIN groups g ON g.id = s."group"
+            INNER JOIN specialities spec ON spec.id = g.speciality
+            WHERE s.id = $1
+        ) current_student
+        CROSS JOIN (
+            SELECT 
+                s.id,
+                CONCAT(p.surname, ' ', p.name) as full_name,
+                g.course,
+                spec.name as speciality
+            FROM students s
+            INNER JOIN people p ON p.id = s.person
+            INNER JOIN groups g ON g.id = s."group"
+            INNER JOIN specialities spec ON spec.id = g.speciality
+            WHERE spec.id = (
+                SELECT spec2.id FROM students s2
+                INNER JOIN groups g2 ON g2.id = s2."group"
+                INNER JOIN specialities spec2 ON spec2.id = g2.speciality
+                WHERE s2.id = $1
+            ) AND s.id != $1
+        ) other_student
+        WHERE current_student.speciality = other_student.speciality
+        ORDER BY other_student.course, other_student.full_name
+        LIMIT 20
+    "#;
+    
+    let rows = sqlx::query(query)
+        .bind(student_id)
+        .bind(student_id)
+        .bind(student_id)
+        .fetch_all(pool)
+        .await?;
+    
+    let result: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "current_student": row.get::<String, _>("current_student"),
+                "other_student": row.get::<String, _>("other_student"),
+                "current_course": row.get::<i32, _>("current_course"),
+                "other_course": row.get::<i32, _>("other_course"),
+                "speciality": row.get::<String, _>("speciality"),
+                "comparison": row.get::<String, _>("comparison")
+            })
+        })
+        .collect();
+    
+    Ok(result)
+}
+
+// UNION - Все активности студента (оценки и записи в учебном плане)
+pub async fn get_student_activities(
+    pool: &PgPool,
+    student_id: i32
+) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+    let query = r#"
+        SELECT 
+            'Оценка' as activity_type,
+            sub.name as item_name,
+            ps.term,
+            'Получена' as status,
+            CONCAT(tp.surname, ' ', tp.name) as related_person
+        FROM marks m
+        INNER JOIN planned_subjects ps ON ps.id = m.subject
+        INNER JOIN subjects sub ON sub.id = ps.subject
+        INNER JOIN teachers t ON t.id = m.teacher
+        INNER JOIN people tp ON tp.id = t.person
+        WHERE m.student = $1
+        
+        UNION
+        
+        SELECT 
+            'Предмет в плане' as activity_type,
+            sub.name as item_name,
+            ps.term,
+            CASE 
+                WHEN m.id IS NOT NULL THEN 'Сдан'
+                ELSE 'Не сдан'
+            END as status,
+            COALESCE(CONCAT(tp.surname, ' ', tp.name), 'Преподаватель не назначен') as related_person
+        FROM students s
+        INNER JOIN groups g ON g.id = s."group"
+        INNER JOIN curriculums cur ON cur.id = g.curriculum
+        INNER JOIN planned_subjects ps ON ps.curriculum = cur.id
+        INNER JOIN subjects sub ON sub.id = ps.subject
+        LEFT JOIN marks m ON m.student = s.id AND m.subject = ps.id
+        LEFT JOIN teachers t ON t.id = m.teacher
+        LEFT JOIN people tp ON tp.id = t.person
+        WHERE s.id = $1
+        
+        ORDER BY term, item_name
+    "#;
+    
+    let rows = sqlx::query(query)
+        .bind(student_id)
+        .bind(student_id)
+        .fetch_all(pool)
+        .await?;
+    
+    let result: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "activity_type": row.get::<String, _>("activity_type"),
+                "item_name": row.get::<String, _>("item_name"),
+                "term": row.get::<i32, _>("term"),
+                "status": row.get::<String, _>("status"),
+                "related_person": row.get::<String, _>("related_person")
+            })
+        })
+        .collect();
+    
+    Ok(result)
+}
+
+// EXCEPT - Предметы которые есть в учебном плане, но не сданы
+pub async fn get_unsettled_subjects(
+    pool: &PgPool,
+    student_id: i32
+) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+    let query = r#"
+        SELECT 
+            sub.name as subject_name,
+            ps.term,
+            c.name as clarification_type
+        FROM students s
+        INNER JOIN groups g ON g.id = s."group"
+        INNER JOIN curriculums cur ON cur.id = g.curriculum
+        INNER JOIN planned_subjects ps ON ps.curriculum = cur.id
+        INNER JOIN subjects sub ON sub.id = ps.subject
+        INNER JOIN clarifications c ON c.id = ps.clarification
+        WHERE s.id = $1
+        
+        EXCEPT
+        
+        SELECT 
+            sub.name as subject_name,
+            ps.term,
+            c.name as clarification_type
+        FROM marks m
+        INNER JOIN planned_subjects ps ON ps.id = m.subject
+        INNER JOIN subjects sub ON sub.id = ps.subject
+        INNER JOIN clarifications c ON c.id = ps.clarification
+        WHERE m.student = $1
+        
+        ORDER BY term, subject_name
+    "#;
+    
+    let rows = sqlx::query(query)
+        .bind(student_id)
+        .bind(student_id)
+        .fetch_all(pool)
+        .await?;
+    
+    let result: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "subject_name": row.get::<String, _>("subject_name"),
+                "term": row.get::<i32, _>("term"),
+                "clarification_type": row.get::<String, _>("clarification_type")
+            })
+        })
+        .collect();
+    
+    Ok(result)
+}
+
+// INTERSECT - Предметы, которые изучают и студент, и его одногруппники
+pub async fn get_common_subjects_with_classmates(
+    pool: &PgPool,
+    student_id: i32
+) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+    let query = r#"
+        SELECT DISTINCT
+            sub.name as subject_name,
+            ps.term
+        FROM students s
+        INNER JOIN groups g ON g.id = s."group"
+        INNER JOIN curriculums cur ON cur.id = g.curriculum
+        INNER JOIN planned_subjects ps ON ps.curriculum = cur.id
+        INNER JOIN subjects sub ON sub.id = ps.subject
+        WHERE s.id = $1
+        
+        INTERSECT
+        
+        SELECT DISTINCT
+            sub.name as subject_name,
+            ps.term
+        FROM students s
+        INNER JOIN groups g ON g.id = s."group"
+        INNER JOIN curriculums cur ON cur.id = g.curriculum
+        INNER JOIN planned_subjects ps ON ps.curriculum = cur.id
+        INNER JOIN subjects sub ON sub.id = ps.subject
+        WHERE s."group" = (
+            SELECT "group" FROM students WHERE id = $1
+        ) AND s.id != $1
+        
+        ORDER BY term, subject_name
+    "#;
+    
+    let rows = sqlx::query(query)
+        .bind(student_id)
+        .bind(student_id)
+        .fetch_all(pool)
+        .await?;
+    
+    let result: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "subject_name": row.get::<String, _>("subject_name"),
+                "term": row.get::<i32, _>("term")
+            })
+        })
+        .collect();
+    
+    Ok(result)
+}
+
+// EXISTS - Проверка наличия оценок у студента
+pub async fn check_student_performance(
+    pool: &PgPool,
+    student_id: i32
+) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+    let query = r#"
+        SELECT 
+            sub.name as subject_name,
+            ps.term,
+            c.name as clarification_type,
+            CASE 
+                WHEN EXISTS(
+                    SELECT 1 FROM marks m 
+                    WHERE m.student = $1 AND m.subject = ps.id
+                ) THEN 'Оценка есть'
+                ELSE 'Оценка отсутствует'
+            END as mark_exists,
+            CASE 
+                WHEN EXISTS(
+                    SELECT 1 FROM teaching_load tl 
+                    WHERE tl.planned_subject = ps.id
+                ) THEN 'Преподаватель назначен'
+                ELSE 'Преподаватель не назначен'
+            END as teacher_assigned
+        FROM students s
+        INNER JOIN groups g ON g.id = s."group"
+        INNER JOIN curriculums cur ON cur.id = g.curriculum
+        INNER JOIN planned_subjects ps ON ps.curriculum = cur.id
+        INNER JOIN subjects sub ON sub.id = ps.subject
+        INNER JOIN clarifications c ON c.id = ps.clarification
+        WHERE s.id = $1
+        ORDER BY ps.term, sub.name
+    "#;
+    
+    let rows = sqlx::query(query)
+        .bind(student_id)
+        .fetch_all(pool)
+        .await?;
+    
+    let result: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "subject_name": row.get::<String, _>("subject_name"),
+                "term": row.get::<i32, _>("term"),
+                "clarification_type": row.get::<String, _>("clarification_type"),
+                "mark_exists": row.get::<String, _>("mark_exists"),
+                "teacher_assigned": row.get::<String, _>("teacher_assigned")
+            })
+        })
+        .collect();
+    
+    Ok(result)
+}
+
+// IN и BETWEEN - Фильтрация предметов по семестрам и критериям
+pub async fn get_subjects_by_criteria(
+    pool: &PgPool,
+    student_id: i32,
+    semesters: Vec<i32>,
+    min_name_length: i32,
+    max_name_length: i32
+) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+    let query = r#"
+        SELECT 
+            sub.name as subject_name,
+            ps.term,
+            c.name as clarification_type,
+            LENGTH(sub.name) as name_length,
+            CASE 
+                WHEN m.id IS NOT NULL THEN 'Сдан'
+                ELSE 'Не сдан'
+            END as completion_status
+        FROM students s
+        INNER JOIN groups g ON g.id = s."group"
+        INNER JOIN curriculums cur ON cur.id = g.curriculum
+        INNER JOIN planned_subjects ps ON ps.curriculum = cur.id
+        INNER JOIN subjects sub ON sub.id = ps.subject
+        INNER JOIN clarifications c ON c.id = ps.clarification
+        LEFT JOIN marks m ON m.student = s.id AND m.subject = ps.id
+        WHERE s.id = $1
+        AND ps.term = ANY($2::int[])
+        AND LENGTH(sub.name) BETWEEN $3 AND $4
+        ORDER BY ps.term, sub.name
+    "#;
+    
+    let rows = sqlx::query(query)
+        .bind(student_id)
+        .bind(semesters)
+        .bind(min_name_length)
+        .bind(max_name_length)
+        .fetch_all(pool)
+        .await?;
+    
+    let result: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "subject_name": row.get::<String, _>("subject_name"),
+                "term": row.get::<i32, _>("term"),
+                "clarification_type": row.get::<String, _>("clarification_type"),
+                "name_length": row.get::<i32, _>("name_length"),
+                "completion_status": row.get::<String, _>("completion_status")
+            })
+        })
+        .collect();
+    
+    Ok(result)
+}
+
+// LIKE и ILIKE - Поиск предметов и одногруппников по паттернам
+pub async fn search_subjects_and_classmates(
+    pool: &PgPool,
+    student_id: i32,
+    search_pattern: &str
+) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+    let query = r#"
+        SELECT 
+            'Предмет' as result_type,
+            sub.name as item_name,
+            sub.description as description,
+            ps.term as term_or_course
+        FROM students s
+        INNER JOIN groups g ON g.id = s."group"
+        INNER JOIN curriculums cur ON cur.id = g.curriculum
+        INNER JOIN planned_subjects ps ON ps.curriculum = cur.id
+        INNER JOIN subjects sub ON sub.id = ps.subject
+        WHERE s.id = $1
+        AND (sub.name ILIKE $2 OR sub.description ILIKE $2)
+        
+        UNION ALL
+        
+        SELECT 
+            'Одногруппник' as result_type,
+            CONCAT(p.surname, ' ', p.name, 
+                CASE WHEN p.patronymic IS NOT NULL THEN ' ' || p.patronymic ELSE '' END) as item_name,
+            spec.name as description,
+            g.course as term_or_course
+        FROM students s1
+        INNER JOIN students s2 ON s1."group" = s2."group" AND s1.id != s2.id
+        INNER JOIN people p ON p.id = s2.person
+        INNER JOIN groups g ON g.id = s2."group"
+        INNER JOIN specialities spec ON spec.id = g.speciality
+        WHERE s1.id = $1
+        AND CONCAT(p.surname, ' ', p.name, ' ', COALESCE(p.patronymic, '')) ILIKE $2
+        
+        ORDER BY result_type, item_name
+    "#;
+    
+    let pattern = format!("%{}%", search_pattern);
+    let rows = sqlx::query(query)
+        .bind(student_id)
+        .bind(&pattern)
+        .bind(student_id)
+        .bind(&pattern)
+        .fetch_all(pool)
+        .await?;
+    
+    let result: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "result_type": row.get::<String, _>("result_type"),
+                "item_name": row.get::<String, _>("item_name"),
+                "description": row.get::<Option<String>, _>("description"),
+                "term_or_course": row.get::<i32, _>("term_or_course")
+            })
+        })
+        .collect();
+    
+    Ok(result)
+}
+
 // Информация о группе и одногруппниках
 pub async fn get_student_group_info(
     pool: &PgPool,
@@ -428,7 +1043,7 @@ pub async fn get_student_data_with_nulls(
     }
 }
 
-// Оригинальные функции (сохраняем для совместимости)
+// === Оригинальные функции (сохраняем для совместимости) ===
 
 // Учебный план студента
 pub async fn get_my_curriculum(pool: &PgPool, student_id: i32) -> Result<Vec<StudentCurriculum>, sqlx::Error> {
