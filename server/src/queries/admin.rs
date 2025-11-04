@@ -1,5 +1,5 @@
 // Административные запросы для SQLx
-use sqlx::{PgPool, FromRow};
+use sqlx::{PgPool, FromRow, Row};
 use chrono::{NaiveDate, DateTime, Utc};
 use serde::{Serialize, Deserialize};
 
@@ -52,6 +52,23 @@ pub struct PersonSearch {
     pub match_position: i32,
 }
 
+#[derive(Debug, FromRow, Serialize, Deserialize)]
+pub struct TeachingLoadStats {
+    pub teacher_name: String,
+    pub subject_count: i64,
+    pub university: String,
+    pub workload_status: String,
+}
+
+#[derive(Debug, FromRow, Serialize, Deserialize)]
+pub struct StructuralUnit {
+    pub unit_name: String,
+    pub unit_type: String,
+    pub head_name: Option<String>,
+    pub children_count: i64,
+    pub parent_unit: Option<String>,
+}
+
 // INNER JOIN - Получить структуру университета с типами подразделений
 pub async fn get_university_structure(pool: &PgPool) -> Result<Vec<UniversityStructure>, sqlx::Error> {
     let query = r#"
@@ -101,49 +118,207 @@ pub async fn get_all_people_with_roles(pool: &PgPool) -> Result<Vec<PersonWithRo
         .await
 }
 
-// UNION - Объединение преподавателей и студентов
-pub async fn get_teachers_and_students_union(pool: &PgPool) -> Result<Vec<PersonWithRole>, sqlx::Error> {
+// FULL JOIN - Полная нагрузка преподавателей со всеми предметами
+pub async fn get_full_teaching_load(pool: &PgPool) -> Result<Vec<TeachingLoadStats>, sqlx::Error> {
     let query = r#"
         SELECT 
-            'Преподаватель' as person_type,
-            p.id,
-            CONCAT(p.surname, ' ', p.name, COALESCE(' ' || p.patronymic, '')) as full_name,
-            u.name as workplace
-        FROM teachers t
-        INNER JOIN people p ON t.person = p.id
-        INNER JOIN units u ON t.work = u.id
-        UNION
-        SELECT 
-            'Студент' as person_type,
-            p.id,
-            CONCAT(p.surname, ' ', p.name, COALESCE(' ' || p.patronymic, '')) as full_name,
-            CONCAT('Группа курс ', g.course, ', ', sp.name) as workplace
-        FROM students s
-        INNER JOIN people p ON s.person = p.id
-        INNER JOIN groups g ON s."group" = g.id
-        INNER JOIN specialities sp ON g.speciality = sp.id
-        ORDER BY person_type, full_name
+            COALESCE(
+                CONCAT(p.surname, ' ', p.name, 
+                CASE WHEN p.patronymic IS NOT NULL THEN ' ' || p.patronymic ELSE '' END), 
+                'Неназначенный преподаватель'
+            ) as teacher_name,
+            COUNT(DISTINCT s.id) as subject_count,
+            COALESCE(uni.name, 'Неизвестный университет') as university,
+            CASE 
+                WHEN COUNT(DISTINCT s.id) > 5 THEN 'Высокая нагрузка'
+                WHEN COUNT(DISTINCT s.id) BETWEEN 3 AND 5 THEN 'Средняя нагрузка'
+                WHEN COUNT(DISTINCT s.id) > 0 THEN 'Низкая нагрузка'
+                ELSE 'Без нагрузки'
+            END as workload_status
+        FROM subjects s
+        FULL JOIN planned_subjects ps ON ps.subject = s.id
+        FULL JOIN teaching_load tl ON tl.planned_subject = ps.id
+        FULL JOIN teachers t ON t.id = tl.teacher
+        FULL JOIN people p ON p.id = t.person
+        FULL JOIN units un ON un.id = t.work
+        FULL JOIN universities uni ON uni.id = un.university
+        GROUP BY p.id, p.surname, p.name, p.patronymic, uni.name
+        HAVING COUNT(DISTINCT s.id) > 0 OR p.id IS NULL
+        ORDER BY subject_count DESC NULLS LAST
     "#;
     
-    #[derive(Debug, FromRow, Serialize)]
-    struct UnionResult {
-        person_type: String,
-        id: i32,
-        full_name: String,
-        workplace: String,
-    }
-    
-    let results = sqlx::query_as::<_, UnionResult>(query)
+    sqlx::query_as::<_, TeachingLoadStats>(query)
         .fetch_all(pool)
-        .await?;
+        .await
+}
+
+// CROSS JOIN LATERAL - Структурные подразделения с количеством дочерних элементов
+pub async fn get_structural_hierarchy(pool: &PgPool) -> Result<Vec<StructuralUnit>, sqlx::Error> {
+    let query = r#"
+        SELECT 
+            u.name as unit_name,
+            ut.name as unit_type,
+            CASE 
+                WHEN p.id IS NOT NULL THEN 
+                    CONCAT(p.surname, ' ', p.name, 
+                    CASE WHEN p.patronymic IS NOT NULL THEN ' ' || p.patronymic ELSE '' END)
+                ELSE NULL 
+            END as head_name,
+            child_stats.children_count,
+            parent_unit.name as parent_unit
+        FROM units u
+        INNER JOIN unit_types ut ON ut.id = u.type
+        LEFT JOIN people p ON p.id = u.head
+        LEFT JOIN units parent_unit ON parent_unit.id = u.parent
+        CROSS JOIN LATERAL (
+            SELECT COUNT(*) as children_count
+            FROM units child 
+            WHERE child.parent = u.id
+        ) child_stats
+        ORDER BY ut.name, children_count DESC
+    "#;
     
-    Ok(results.into_iter().map(|r| PersonWithRole {
-        id: r.id,
-        full_name: r.full_name,
-        birthday: None,
-        role_type: r.person_type,
-        age: None,
-    }).collect())
+    sqlx::query_as::<_, StructuralUnit>(query)
+        .fetch_all(pool)
+        .await
+}
+
+// RIGHT JOIN - Все предметы и их возможные преподаватели
+pub async fn get_subjects_with_possible_teachers(pool: &PgPool) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+    let query = r#"
+        SELECT 
+            s.name as subject_name,
+            COALESCE(s.description, 'Описание отсутствует') as description,
+            COALESCE(
+                CONCAT(p.surname, ' ', p.name, 
+                CASE WHEN p.patronymic IS NOT NULL THEN ' ' || p.patronymic ELSE '' END),
+                'Преподаватель не назначен'
+            ) as teacher_name,
+            COALESCE(ps.term, 0) as term,
+            COALESCE(c.name, 'Форма контроля не указана') as clarification_type
+        FROM teaching_load tl
+        RIGHT JOIN planned_subjects ps ON ps.id = tl.planned_subject
+        RIGHT JOIN subjects s ON s.id = ps.subject
+        LEFT JOIN teachers t ON t.id = tl.teacher
+        LEFT JOIN people p ON p.id = t.person
+        LEFT JOIN clarifications c ON c.id = ps.clarification
+        ORDER BY s.name, ps.term NULLS LAST
+    "#;
+    
+    let rows = sqlx::query(query).fetch_all(pool).await?;
+    let result: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "subject_name": row.get::<String, _>("subject_name"),
+                "description": row.get::<String, _>("description"),
+                "teacher_name": row.get::<String, _>("teacher_name"),
+                "term": row.get::<i32, _>("term"),
+                "clarification_type": row.get::<String, _>("clarification_type")
+            })
+        })
+        .collect();
+    
+    Ok(result)
+}
+
+// UNION ALL - Все люди в системе с их ролями
+pub async fn get_teachers_and_students_union(pool: &PgPool) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+    let query = r#"
+        SELECT 
+            p.id,
+            p.surname,
+            p.name,
+            p.patronymic,
+            'Студент' as role,
+            s.id as role_id,
+            g.course as additional_info
+        FROM people p
+        INNER JOIN students s ON s.person = p.id
+        INNER JOIN groups g ON g.id = s."group"
+        
+        UNION ALL
+        
+        SELECT 
+            p.id,
+            p.surname,
+            p.name,
+            p.patronymic,
+            'Преподаватель' as role,
+            t.id as role_id,
+            0 as additional_info
+        FROM people p
+        INNER JOIN teachers t ON t.person = p.id
+        
+        UNION ALL
+        
+        SELECT 
+            p.id,
+            p.surname,
+            p.name,
+            p.patronymic,
+            'Ректор' as role,
+            u.id as role_id,
+            0 as additional_info
+        FROM people p
+        INNER JOIN universities u ON u.rector = p.id
+        
+        ORDER BY surname, name
+    "#;
+    
+    let rows = sqlx::query(query).fetch_all(pool).await?;
+    let result: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "id": row.get::<i32, _>("id"),
+                "surname": row.get::<String, _>("surname"),
+                "name": row.get::<String, _>("name"),
+                "patronymic": row.get::<Option<String>, _>("patronymic"),
+                "role": row.get::<String, _>("role"),
+                "role_id": row.get::<i32, _>("role_id"),
+                "additional_info": row.get::<i32, _>("additional_info")
+            })
+        })
+        .collect();
+    
+    Ok(result)
+}
+
+// INTERSECT - Общие люди в разных ролях
+pub async fn get_people_multiple_roles(pool: &PgPool) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+    let query = r#"
+        SELECT DISTINCT
+            p.id,
+            CONCAT(p.surname, ' ', p.name, 
+                CASE WHEN p.patronymic IS NOT NULL THEN ' ' || p.patronymic ELSE '' END) as full_name
+        FROM people p
+        INNER JOIN teachers t ON p.id = t.person
+        
+        INTERSECT
+        
+        SELECT DISTINCT
+            p.id,
+            CONCAT(p.surname, ' ', p.name, 
+                CASE WHEN p.patronymic IS NOT NULL THEN ' ' || p.patronymic ELSE '' END) as full_name
+        FROM people p
+        INNER JOIN units u ON p.id = u.head
+        
+        ORDER BY full_name
+    "#;
+    
+    let rows = sqlx::query(query).fetch_all(pool).await?;
+    let result: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "id": row.get::<i32, _>("id"),
+                "full_name": row.get::<String, _>("full_name")
+            })
+        })
+        .collect();
+    
+    Ok(result)
 }
 
 // EXCEPT - Люди, которые НЕ связаны с университетом
@@ -185,6 +360,7 @@ pub async fn get_people_not_in_university(pool: &PgPool) -> Result<Vec<PersonWit
             FROM people p
             INNER JOIN units un ON p.id = un.head
         )
+        ORDER BY full_name
     "#;
     
     #[derive(Debug, FromRow)]
@@ -206,24 +382,102 @@ pub async fn get_people_not_in_university(pool: &PgPool) -> Result<Vec<PersonWit
     }).collect())
 }
 
-// EXISTS - Дисциплины, которые реально преподаются
-pub async fn check_active_subjects(pool: &PgPool) -> Result<Vec<(i32, String, Option<String>)>, sqlx::Error> {
+// EXISTS - Преподаватели с нагрузкой и проверка возраста
+pub async fn get_teachers_workload_status(pool: &PgPool) -> Result<Vec<serde_json::Value>, sqlx::Error> {
     let query = r#"
         SELECT 
-            s.id,
-            s.name,
-            s.description
-        FROM subjects s
-        WHERE EXISTS (
-            SELECT 1 
-            FROM planned_subjects ps 
-            WHERE ps.subject = s.id
-        )
+            t.id,
+            CONCAT(p.surname, ' ', p.name, 
+                CASE WHEN p.patronymic IS NOT NULL THEN ' ' || p.patronymic ELSE '' END) as full_name,
+            CASE 
+                WHEN EXISTS(SELECT 1 FROM teaching_load tl WHERE tl.teacher = t.id) 
+                THEN 'Имеет нагрузку'
+                ELSE 'Без нагрузки'
+            END as workload_status,
+            CASE 
+                WHEN EXTRACT(YEAR FROM AGE(CURRENT_DATE, p.birthday)) BETWEEN 25 AND 35 THEN 'Молодой'
+                WHEN EXTRACT(YEAR FROM AGE(CURRENT_DATE, p.birthday)) BETWEEN 36 AND 50 THEN 'Средний возраст'
+                WHEN EXTRACT(YEAR FROM AGE(CURRENT_DATE, p.birthday)) > 50 THEN 'Опытный'
+                ELSE 'Возраст не указан'
+            END as age_category,
+            uni.name as university_name
+        FROM teachers t
+        INNER JOIN people p ON p.id = t.person
+        INNER JOIN units u ON u.id = t.work
+        INNER JOIN universities uni ON uni.id = u.university
+        WHERE p.birthday IS NOT NULL
+        ORDER BY p.surname, p.name
     "#;
     
-    sqlx::query_as::<_, (i32, String, Option<String>)>(query)
+    let rows = sqlx::query(query).fetch_all(pool).await?;
+    let result: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "id": row.get::<i32, _>("id"),
+                "full_name": row.get::<String, _>("full_name"),
+                "workload_status": row.get::<String, _>("workload_status"),
+                "age_category": row.get::<String, _>("age_category"),
+                "university_name": row.get::<String, _>("university_name")
+            })
+        })
+        .collect();
+    
+    Ok(result)
+}
+
+// IN, ALL, ANY, SOME - Поиск студентов по нескольким критериям
+pub async fn get_students_by_multiple_criteria(
+    pool: &PgPool,
+    courses: Vec<i32>,
+    speciality_ids: Vec<i32>
+) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+    let query = r#"
+        SELECT DISTINCT
+            s.id,
+            CONCAT(p.surname, ' ', p.name, 
+                CASE WHEN p.patronymic IS NOT NULL THEN ' ' || p.patronymic ELSE '' END) as student_name,
+            g.course,
+            spec.name as speciality,
+            CASE 
+                WHEN g.course = ANY($1::int[]) THEN 'Подходящий курс'
+                ELSE 'Не подходящий курс'
+            END as course_match,
+            CASE 
+                WHEN spec.id = ANY($2::int[]) THEN 'Подходящая специальность'
+                ELSE 'Не подходящая специальность'
+            END as speciality_match
+        FROM students s
+        INNER JOIN people p ON p.id = s.person
+        INNER JOIN groups g ON g.id = s."group"
+        INNER JOIN specialities spec ON spec.id = g.speciality
+        WHERE g.course = ANY($1::int[])
+          AND spec.id = ANY($2::int[])
+          AND EXISTS(SELECT 1 FROM marks m WHERE m.student = s.id)
+        ORDER BY g.course, student_name
+    "#;
+    
+    let rows = sqlx::query(query)
+        .bind(courses)
+        .bind(speciality_ids)
         .fetch_all(pool)
-        .await
+        .await?;
+    
+    let result: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "id": row.get::<i32, _>("id"),
+                "student_name": row.get::<String, _>("student_name"),
+                "course": row.get::<i32, _>("course"),
+                "speciality": row.get::<String, _>("speciality"),
+                "course_match": row.get::<String, _>("course_match"),
+                "speciality_match": row.get::<String, _>("speciality_match")
+            })
+        })
+        .collect();
+    
+    Ok(result)
 }
 
 // BETWEEN - Люди в определенном возрастном диапазоне
@@ -247,35 +501,258 @@ pub async fn get_people_by_age_range(pool: &PgPool, min_age: i32, max_age: i32) 
         .await
 }
 
-// LIKE и ILIKE - Поиск людей по шаблону имени
-pub async fn search_people_by_name(pool: &PgPool, search_pattern: &str) -> Result<Vec<PersonSearch>, sqlx::Error> {
+// LIKE и ILIKE - Поиск людей по шаблону имени с функциями для работы со строками
+pub async fn search_people_formatted(
+    pool: &PgPool, 
+    search_term: &str
+) -> Result<Vec<serde_json::Value>, sqlx::Error> {
     let query = r#"
         SELECT 
             id,
-            surname,
-            name,
-            patronymic,
+            UPPER(CONCAT(surname, ' ', name)) as display_name,
+            LENGTH(CONCAT(surname, name)) as name_length,
             CASE 
-                WHEN surname ILIKE $1 THEN 'Найдено в фамилии'
-                WHEN name ILIKE $1 THEN 'Найдено в имени'
-                WHEN patronymic ILIKE $1 THEN 'Найдено в отчестве'
+                WHEN STRPOS(LOWER(CONCAT(surname, ' ', name, ' ', COALESCE(patronymic, ''))), $1) > 0 
+                THEN 'Найдено'
                 ELSE 'Не найдено'
-            END as match_location,
+            END as search_status,
+            OVERLAY(surname PLACING '***' FROM 2 FOR 2) as masked_surname,
+            SUBSTRING(name FROM 1 FOR 3) as name_prefix,
+            REPLACE(LOWER(surname), 'а', 'А') as surname_modified,
+            BTRIM(CONCAT('  ', name, '  ')) as trimmed_name,
             POSITION(LOWER($1) IN LOWER(CONCAT(surname, ' ', name, ' ', COALESCE(patronymic, ''))))::INT as match_position
         FROM people
-        WHERE surname ILIKE $1 
-           OR name ILIKE $1 
-           OR patronymic ILIKE $1
+        WHERE LOWER(CONCAT(surname, ' ', name, ' ', COALESCE(patronymic, ''))) ILIKE $1
+        ORDER BY surname, name
+        LIMIT 50
     "#;
     
-    let pattern = format!("%{}%", search_pattern);
-    sqlx::query_as::<_, PersonSearch>(query)
-        .bind(&pattern)
+    let search_pattern = format!("%{}%", search_term.to_lowercase());
+    let rows = sqlx::query(query)
+        .bind(search_pattern)
+        .fetch_all(pool)
+        .await?;
+    
+    let result: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "id": row.get::<i32, _>("id"),
+                "display_name": row.get::<String, _>("display_name"),
+                "name_length": row.get::<i32, _>("name_length"),
+                "search_status": row.get::<String, _>("search_status"),
+                "masked_surname": row.get::<String, _>("masked_surname"),
+                "name_prefix": row.get::<String, _>("name_prefix"),
+                "surname_modified": row.get::<String, _>("surname_modified"),
+                "trimmed_name": row.get::<String, _>("trimmed_name"),
+                "match_position": row.get::<i32, _>("match_position")
+            })
+        })
+        .collect();
+    
+    Ok(result)
+}
+
+// Самосоединение - Иерархия структурных подразделений
+pub async fn get_department_hierarchy(pool: &PgPool) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+    let query = r#"
+        SELECT 
+            parent.name as parent_unit,
+            child.name as child_unit,
+            parent_type.name as parent_type,
+            child_type.name as child_type,
+            COALESCE(
+                CONCAT(parent_head.surname, ' ', parent_head.name),
+                'Руководитель не назначен'
+            ) as parent_head,
+            COALESCE(
+                CONCAT(child_head.surname, ' ', child_head.name),
+                'Руководитель не назначен'
+            ) as child_head
+        FROM units parent
+        INNER JOIN units child ON child.parent = parent.id
+        INNER JOIN unit_types parent_type ON parent_type.id = parent.type
+        INNER JOIN unit_types child_type ON child_type.id = child.type
+        LEFT JOIN people parent_head ON parent_head.id = parent.head
+        LEFT JOIN people child_head ON child_head.id = child.head
+        ORDER BY parent.name, child.name
+    "#;
+    
+    let rows = sqlx::query(query).fetch_all(pool).await?;
+    let result: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "parent_unit": row.get::<String, _>("parent_unit"),
+                "child_unit": row.get::<String, _>("child_unit"),
+                "parent_type": row.get::<String, _>("parent_type"),
+                "child_type": row.get::<String, _>("child_type"),
+                "parent_head": row.get::<String, _>("parent_head"),
+                "child_head": row.get::<String, _>("child_head")
+            })
+        })
+        .collect();
+    
+    Ok(result)
+}
+
+// Функции преобразования типов (CAST, ::, COALESCE, NULLIF, GREATEST, LEAST)
+pub async fn get_formatted_person_data(pool: &PgPool) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+    let query = r#"
+        SELECT 
+            p.id,
+            CONCAT(p.surname, ' ', p.name, 
+                CASE WHEN p.patronymic IS NOT NULL THEN ' ' || p.patronymic ELSE '' END) as full_name,
+            COALESCE(p.snils::text, 'СНИЛС не указан') as snils_info,
+            COALESCE(p.inn::text, 'ИНН не указан') as inn_info,
+            CAST(p.birthday AS text) as birth_date,
+            p.birthday::text as birth_date_alt,
+            NULLIF(BTRIM(p.patronymic), '') as clean_patronymic,
+            GREATEST(
+                LENGTH(p.surname), 
+                LENGTH(p.name), 
+                COALESCE(LENGTH(p.patronymic), 0)
+            ) as max_name_length,
+            LEAST(
+                COALESCE(p.snils, 999999999999), 
+                COALESCE(p.inn, 999999999999)
+            ) as min_document_number
+        FROM people p
+        WHERE p.birthday IS NOT NULL
+        ORDER BY p.surname, p.name
+        LIMIT 100
+    "#;
+    
+    let rows = sqlx::query(query).fetch_all(pool).await?;
+    let result: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "id": row.get::<i32, _>("id"),
+                "full_name": row.get::<String, _>("full_name"),
+                "snils_info": row.get::<String, _>("snils_info"),
+                "inn_info": row.get::<String, _>("inn_info"),
+                "birth_date": row.get::<Option<String>, _>("birth_date"),
+                "birth_date_alt": row.get::<Option<String>, _>("birth_date_alt"),
+                "clean_patronymic": row.get::<Option<String>, _>("clean_patronymic"),
+                "max_name_length": row.get::<i32, _>("max_name_length"),
+                "min_document_number": row.get::<i64, _>("min_document_number")
+            })
+        })
+        .collect();
+    
+    Ok(result)
+}
+
+// Функции даты и времени - Анализ временных данных
+pub async fn get_age_statistics(pool: &PgPool) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+    let query = r#"
+        SELECT 
+            DATE_PART('year', birthday) as birth_year,
+            COUNT(*) as people_count,
+            AVG(EXTRACT(YEAR FROM AGE(CURRENT_DATE, birthday))) as average_age,
+            MIN(AGE(CURRENT_DATE, birthday)) as min_age,
+            MAX(AGE(CURRENT_DATE, birthday)) as max_age,
+            CURRENT_TIMESTAMP as report_time,
+            NOW()::date as current_date_only,
+            CURRENT_DATE as today,
+            CURRENT_TIME as current_time_now,
+            LOCALTIMESTAMP as local_timestamp
+        FROM people
+        WHERE birthday IS NOT NULL
+            AND birthday BETWEEN '1950-01-01' AND CURRENT_DATE
+        GROUP BY DATE_PART('year', birthday)
+        HAVING COUNT(*) >= 1
+        ORDER BY birth_year DESC
+        LIMIT 20
+    "#;
+    
+    let rows = sqlx::query(query).fetch_all(pool).await?;
+    let result: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "birth_year": row.get::<f64, _>("birth_year"),
+                "people_count": row.get::<i64, _>("people_count"),
+                "average_age": row.get::<Option<f64>, _>("average_age"),
+                "min_age": row.get::<sqlx::postgres::types::PgInterval, _>("min_age").to_string(),
+                "max_age": row.get::<sqlx::postgres::types::PgInterval, _>("max_age").to_string(),
+                "report_time": row.get::<DateTime<Utc>, _>("report_time"),
+                "current_date_only": row.get::<NaiveDate, _>("current_date_only"),
+                "today": row.get::<NaiveDate, _>("today"),
+                "local_timestamp": row.get::<chrono::NaiveDateTime, _>("local_timestamp")
+            })
+        })
+        .collect();
+    
+    Ok(result)
+}
+
+// EXISTS - Дисциплины, которые реально преподаются
+pub async fn check_active_subjects(pool: &PgPool) -> Result<Vec<(i32, String, Option<String>)>, sqlx::Error> {
+    let query = r#"
+        SELECT 
+            s.id,
+            s.name,
+            s.description
+        FROM subjects s
+        WHERE EXISTS (
+            SELECT 1 
+            FROM planned_subjects ps 
+            WHERE ps.subject = s.id
+        )
+        ORDER BY s.name
+    "#;
+    
+    sqlx::query_as::<_, (i32, String, Option<String>)>(query)
         .fetch_all(pool)
         .await
 }
 
-// Агрегатные функции и группировка
+// Агрегатные функции и группировка с HAVING - Статистика по специальностям
+pub async fn get_speciality_statistics(pool: &PgPool) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+    let query = r#"
+        SELECT 
+            s.code,
+            s.name as speciality_name,
+            d.name as degree_name,
+            COUNT(g.id) as groups_count,
+            COUNT(st.id) as students_count,
+            AVG(g.course) as avg_course,
+            MIN(g.course) as min_course,
+            MAX(g.course) as max_course,
+            SUM(CASE WHEN g.course >= 3 THEN 1 ELSE 0 END) as senior_groups
+        FROM specialities s
+        INNER JOIN degrees d ON d.id = s.degree
+        LEFT JOIN groups g ON g.speciality = s.id
+        LEFT JOIN students st ON st."group" = g.id
+        GROUP BY s.id, s.code, s.name, d.name
+        HAVING COUNT(g.id) > 0
+        ORDER BY students_count DESC, speciality_name
+    "#;
+    
+    let rows = sqlx::query(query).fetch_all(pool).await?;
+    let result: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "code": row.get::<String, _>("code"),
+                "speciality_name": row.get::<String, _>("speciality_name"),
+                "degree_name": row.get::<Option<String>, _>("degree_name"),
+                "groups_count": row.get::<i64, _>("groups_count"),
+                "students_count": row.get::<i64, _>("students_count"),
+                "avg_course": row.get::<Option<f64>, _>("avg_course"),
+                "min_course": row.get::<Option<i32>, _>("min_course"),
+                "max_course": row.get::<Option<i32>, _>("max_course"),
+                "senior_groups": row.get::<i64, _>("senior_groups")
+            })
+        })
+        .collect();
+    
+    Ok(result)
+}
+
+// Агрегатные функции с группировкой - Оригинальная статистика университетов
 pub async fn get_university_statistics(pool: &PgPool) -> Result<Vec<UniversityStatistics>, sqlx::Error> {
     let query = r#"
         SELECT 
